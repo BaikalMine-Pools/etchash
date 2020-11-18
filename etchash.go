@@ -19,6 +19,7 @@
 package etchash
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -418,24 +419,32 @@ type Light struct {
 }
 
 // Verify checks whether the block's nonce is valid.
-func (l *Light) Verify(block Block) bool {
+func (l *Light) VerifyShare(block Block, shareDiff *big.Int) (bool, bool, int64, common.Hash) {
+	// For return arguments
+	zeroHash := common.Hash{}
 	// TODO: do etchash_quick_verify before getCache in order
 	// to prevent DOS attacks.
 	blockNum := block.NumberU64()
 	if blockNum >= epochLengthDefault*2048 {
 		log.Debug(fmt.Sprintf("block number %d too high, limit is %d", blockNum, epochLengthDefault*2048))
-		return false
+		return false, false, 0, zeroHash
 	}
 
-	difficulty := block.Difficulty()
+	blockDiff := block.Difficulty()
 	/* Cannot happen if block header diff is validated prior to PoW, but can
 		 happen if PoW is checked first due to parallel PoW checking.
 		 We could check the minimum valid difficulty but for SoC we avoid (duplicating)
 	   Ethereum protocol consensus rules here which are not in scope of Etchash
 	*/
-	if difficulty.Cmp(common.Big0) == 0 {
+	if blockDiff.Cmp(common.Big0) == 0 {
 		log.Debug("invalid block difficulty")
-		return false
+		return false, false, 0, zeroHash
+	}
+
+	if shareDiff.Cmp(common.Big0) == 0 {
+		log.Debug("invalid share difficulty")
+		return false, false, 0, zeroHash
+
 	}
 
 	epochLength := calcEpochLength(blockNum, l.ecip1099FBlock)
@@ -450,13 +459,95 @@ func (l *Light) Verify(block Block) bool {
 	mixDigest, result := cache.compute(uint64(dagSize), block.HashNoNonce(), block.Nonce())
 
 	// avoid mixdigest malleability as it's not included in a block's "hashNononce"
-	if block.MixDigest() != mixDigest {
-		return false
+	if blkMix := block.MixDigest(); blkMix != zeroHash && blkMix != mixDigest {
+		return false, false, 0, zeroHash
 	}
 
-	// The actual check.
-	target := new(big.Int).Div(maxUint256, difficulty)
-	return result.Big().Cmp(target) <= 0
+	blockTarget := new(big.Int).Div(maxUint256, blockDiff)
+	shareTarget := new(big.Int).Div(maxUint256, shareDiff)
+	actualDiff := new(big.Int).Div(maxUint256, result.Big())
+	return result.Big().Cmp(shareTarget) <= 0, result.Big().Cmp(blockTarget) <= 0, actualDiff.Int64(), mixDigest
+}
+
+// Verify checks whether the block's nonce is valid.
+func (l *Light) Verify(block Block) bool {
+	_, ok, _, _ := l.VerifyShare(block, block.Difficulty())
+	return ok
+}
+
+/*
+    support code for open-ethereum-pool, NiceHash extensions
+	Wolfgang Frisch https://github.com/wfr
+*/
+func (l *Light) computeMixDigest(blockNum uint64, hashNoNonce common.Hash, nonce uint64) (mixDigest common.Hash, result common.Hash) {
+	fblock := ecip1099FBlock
+	epochLength := calcEpochLength(blockNum, &fblock)
+	epoch := calcEpoch(blockNum, epochLength)
+
+	cache := l.getCache(blockNum)
+	dagSize := datasetSize(epoch)
+	return cache.compute(uint64(dagSize), hashNoNonce, nonce)
+}
+
+func le256todouble(target [32]byte) float64 {
+	var bits192 float64 = 6277101735386680763835789423207666416102355444464034512896.0
+	var bits128 float64 = 340282366920938463463374607431768211456.0
+	var bits64 float64 = 18446744073709551616.0
+	var dcut64 float64
+	var data64 uint64
+
+	buf := bytes.NewReader(target[24:32])
+	binary.Read(buf, binary.LittleEndian, &data64)
+	dcut64 = float64(data64) * bits192
+
+	buf = bytes.NewReader(target[16:24])
+	binary.Read(buf, binary.LittleEndian, &data64)
+	dcut64 += float64(data64) * bits128
+
+	buf = bytes.NewReader(target[8:16])
+	binary.Read(buf, binary.LittleEndian, &data64)
+	dcut64 += float64(data64) * bits64
+
+	buf = bytes.NewReader(target[0:16])
+	binary.Read(buf, binary.LittleEndian, &data64)
+	dcut64 += float64(data64)
+
+	return dcut64
+}
+
+func share_diff(h [32]byte) float64 {
+	var truediffone float64 = 26959535291011309493156476344723991336010898738574164086137773096960.0
+	var s64 float64
+
+	var hash_end [32]byte
+	for i := 0; i < 32; i++ {
+		hash_end[31-i] = h[i]
+	}
+
+	s64 = le256todouble(hash_end)
+	if s64 <= 0 {
+		return 0.0
+	}
+	return truediffone / s64
+}
+
+func (l *Light) GetShareDiff(blockNum uint64, headerHash common.Hash, nonce uint64) (diff float64, mixDigest common.Hash) {
+	md, h := l.computeMixDigest(blockNum, headerHash, nonce)
+	var b [32]byte
+	copy(b[:], h.Bytes())
+	return share_diff(b), md
+}
+
+/* open-ethereum-pool additions END */
+
+// compute() to get mixhash and result
+func (l *Light) Compute(blockNum uint64, hashNoNonce common.Hash, nonce uint64) (mixDigest common.Hash, result common.Hash) {
+	epochLength := calcEpochLength(blockNum, l.ecip1099FBlock)
+	epoch := calcEpoch(blockNum, epochLength)
+
+	cache := l.getCache(blockNum)
+	dagSize := datasetSize(epoch)
+	return cache.compute(uint64(dagSize), hashNoNonce, nonce)
 }
 
 func (l *Light) getCache(blockNum uint64) *cache {
