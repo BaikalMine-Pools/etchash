@@ -480,8 +480,7 @@ func (l *Light) Verify(block Block) bool {
 	Wolfgang Frisch https://github.com/wfr
 */
 func (l *Light) computeMixDigest(blockNum uint64, hashNoNonce common.Hash, nonce uint64) (mixDigest common.Hash, result common.Hash) {
-	fblock := ecip1099FBlock
-	epochLength := calcEpochLength(blockNum, &fblock)
+	epochLength := calcEpochLength(blockNum, l.ecip1099FBlock)
 	epoch := calcEpoch(blockNum, epochLength)
 
 	cache := l.getCache(blockNum)
